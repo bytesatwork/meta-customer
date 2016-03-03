@@ -1,7 +1,7 @@
 # Copyright (C) 2016 Daniel Ammann <daniel.ammann@bytesatwork.ch>
 # Released under the MIT license (see COPYING.MIT for the terms)
 
-COMPATIBLE_MACHINE += "|bytepanel"
+COMPATIBLE_MACHINE += "|customer-machine"
 
 FILESEXTRAPATHS_prepend := "${THISDIR}/linux-ti-staging:"
 
