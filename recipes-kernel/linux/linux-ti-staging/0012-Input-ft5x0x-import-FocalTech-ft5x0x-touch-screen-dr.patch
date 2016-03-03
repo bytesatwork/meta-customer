@@ -1,0 +1,617 @@
+From 4689e8b1c3c35fe72b7cd426d78d84176317d08f Mon Sep 17 00:00:00 2001
+From: Daniel Ammann <daniel.ammann@bytesatwork.ch>
+Date: Wed, 10 Feb 2016 14:03:55 +0100
+Subject: [PATCH 12/13] Input: ft5x0x: import FocalTech ft5x0x touch screen
+ driver
+
+Notes:
+- revert unnecessary rename of struct edt_ft5x06_platform_data members
+- use device tree to attach driver
+- remove old driver concepts (__dev* macros)
+- touch point released is not an error
+- improved debug messages
+- initially set ABS_MT_PRESSURE
+---
+ drivers/input/touchscreen/Kconfig     |   4 +
+ drivers/input/touchscreen/Makefile    |   1 +
+ drivers/input/touchscreen/ft5x06_ts.c | 541 ++++++++++++++++++++++++++++++++++
+ include/linux/input/edt-ft5x06.h      |   8 +-
+ 4 files changed, 552 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/input/touchscreen/ft5x06_ts.c
+
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index ef65fbc..e1bc546 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -583,6 +583,10 @@ config TOUCHSCREEN_EDT_FT5X06
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called edt-ft5x06.
+ 
++config TOUCHSCREEN_FT5X0X
++	tristate "FocalTech ft5x0x TouchScreen driver"
++	depends on I2C
++
+ config TOUCHSCREEN_MIGOR
+ 	tristate "Renesas MIGO-R touchscreen"
+ 	depends on SH_MIGOR && I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index 0cb7e18..748a24d 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -29,6 +29,7 @@ obj-$(CONFIG_TOUCHSCREEN_DA9034)	+= da9034-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_DA9052)	+= da9052_tsi.o
+ obj-$(CONFIG_TOUCHSCREEN_DYNAPRO)	+= dynapro.o
+ obj-$(CONFIG_TOUCHSCREEN_EDT_FT5X06)	+= edt-ft5x06.o
++obj-$(CONFIG_TOUCHSCREEN_FT5X0X)	+= ft5x06_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_HAMPSHIRE)	+= hampshire.o
+ obj-$(CONFIG_TOUCHSCREEN_GUNZE)		+= gunze.o
+ obj-$(CONFIG_TOUCHSCREEN_EETI)		+= eeti_ts.o
+diff --git a/drivers/input/touchscreen/ft5x06_ts.c b/drivers/input/touchscreen/ft5x06_ts.c
+new file mode 100644
+index 0000000..ee10d42
+--- /dev/null
++++ b/drivers/input/touchscreen/ft5x06_ts.c
+@@ -0,0 +1,541 @@
++/*
++ * drivers/input/touchscreen/ft5x0x_ts.c
++ *
++ * FocalTech ft5x0x TouchScreen driver.
++ *
++ * Copyright (C) 2014 bytes at work AG
++ *
++ * Based on driver from FocalTech Systems
++ * Copyright (c) 2010  Focal tech Ltd.
++ * Author: <wenfs@Focaltech-systems.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <asm/io.h>
++#include <asm/div64.h>
++#include <linux/timer.h>
++#include <linux/gpio.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/input/mt.h>
++#include <linux/input/edt-ft5x06.h>
++
++#define FT5X0X_REG_FIRMID 0xa6
++#define FT5X0X_NAME "ft5x06_ts"
++
++#define PRESS_MAX       255
++
++#define REG_THRESHOLD	0x80
++#define REG_GAIN	0x92
++#define REG_OFFSET	0x93
++
++/* FIXME read resolution from device tree(?) */
++#define CONFIG_TOUCHSCREEN_FT5XX6_EP1010ML00
++
++#if defined(CONFIG_TOUCHSCREEN_FT5XX6_EP0500M09)
++#define TOUCH_X 1280
++#define TOUCH_Y 786
++#define MAX_SUPPORT_POINTS 5
++#elif defined(CONFIG_TOUCHSCREEN_FT5XX6_EP0700M09)
++#define TOUCH_X 1792
++#define TOUCH_Y 1024
++#define MAX_SUPPORT_POINTS 5
++#elif defined(CONFIG_TOUCHSCREEN_FT5XX6_EP1010ML00)
++#define TOUCH_X 2432
++#define TOUCH_Y 1344
++#define MAX_SUPPORT_POINTS 10
++#endif
++
++#define GPIO_TO_PIN(bank, gpio)		(32 * (bank) + (gpio))
++#define FT5X06_IRQ			GPIO_TO_PIN(1,24)
++
++static struct edt_ft5x06_platform_data am335x_touchscreen_edt_data = {
++        .irq_pin = FT5X06_IRQ,
++        .disp_x = 1024,
++        .disp_y = 600,
++};
++
++static struct i2c_client *this_client;
++
++struct ts_event {
++	u16	x[MAX_SUPPORT_POINTS];
++	u16	y[MAX_SUPPORT_POINTS];
++	u16	pressure;
++	u8	touch_point;
++};
++
++struct ft5x0x_ts_data {
++	struct input_dev	*input_dev;
++	struct ts_event		event;
++	struct work_struct	pen_event_work;
++	struct workqueue_struct *ts_workqueue;
++};
++
++/* I2C Transfers */
++static int ft5x0x_i2c_rxdata(char *rxdata, int length)
++{
++	int ret;
++
++	struct i2c_msg msgs[] = {
++		{
++			.addr	= this_client->addr,
++			.flags	= 0,
++			.len	= 1,
++			.buf	= rxdata,
++		},
++		{
++			.addr	= this_client->addr,
++			.flags	= I2C_M_RD,
++			.len	= length,
++			.buf	= rxdata,
++		},
++	};
++
++	ret = i2c_transfer(this_client->adapter, msgs, 2);
++	if (ret < 0)
++		pr_err("msg %s i2c read error: %d\n", __func__, ret);
++
++	return ret;
++}
++
++static int ft5x0x_read_reg(u8 addr, u8 *pdata)
++{
++	int ret;
++	u8 buf[2] = {0};
++
++	buf[0] = addr;
++
++	ret = ft5x0x_i2c_rxdata(buf, 1);
++
++	*pdata = buf[0];
++	return ret;
++}
++
++static int ft5x0x_i2c_txdata(char *txdata, int length)
++{
++	int ret;
++
++	struct i2c_msg msg[] = {
++		{
++			.addr   = this_client->addr,
++			.flags  = 0,
++			.len    = length,
++			.buf    = txdata,
++		},
++	};
++
++	ret = i2c_transfer(this_client->adapter, msg, 1);
++	if (ret < 0)
++		pr_err("%s i2c write error: %d\n", __func__, ret);
++
++	return ret;
++}
++
++
++static int ft5x0x_write_reg(u8 addr, u8 para)
++{
++	u8 buf[3];
++	int ret = -1;
++
++	buf[0] = addr;
++	buf[1] = para;
++	ret = ft5x0x_i2c_txdata(buf, 2);
++	if (ret < 0) {
++		pr_err("write reg failed! %#x ret: %d", buf[0], ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++/* sysfs */
++
++static ssize_t ft5x0x_get_threshold(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	u8 threshold;
++
++	ft5x0x_read_reg(REG_THRESHOLD, &threshold);
++
++	return scnprintf(buf, PAGE_SIZE, "%d\n", threshold);
++}
++
++static ssize_t ft5x0x_set_threshold(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	u8 threshold;
++
++	threshold = simple_strtoul(buf, NULL, 10);
++
++	ft5x0x_write_reg(REG_THRESHOLD, threshold);
++
++	return count;
++}
++
++static ssize_t ft5x0x_get_gain(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	u8 gain;
++
++	ft5x0x_read_reg(REG_GAIN, &gain);
++
++	return scnprintf(buf, PAGE_SIZE, "%d\n", gain);
++}
++
++static ssize_t ft5x0x_set_gain(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	u8 gain;
++
++	gain = simple_strtoul(buf, NULL, 10);
++
++	ft5x0x_write_reg(REG_GAIN, gain);
++
++	return count;
++}
++
++static ssize_t ft5x0x_get_offset(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	u8 offset;
++
++	ft5x0x_read_reg(REG_OFFSET, &offset);
++
++	return scnprintf(buf, PAGE_SIZE, "%d\n", offset);
++}
++
++static ssize_t ft5x0x_set_offset(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	u8 offset;
++
++	offset = simple_strtoul(buf, NULL, 10);
++
++	ft5x0x_write_reg(REG_OFFSET, offset);
++
++	return count;
++}
++
++static DEVICE_ATTR(threshold, S_IWUSR | S_IRUGO, ft5x0x_get_threshold, ft5x0x_set_threshold);
++static DEVICE_ATTR(gain, S_IWUSR | S_IRUGO, ft5x0x_get_gain, ft5x0x_set_gain);
++static DEVICE_ATTR(offset, S_IWUSR | S_IRUGO, ft5x0x_get_offset, ft5x0x_set_offset);
++
++static const struct attribute *ft5x0x_attr[] = {
++	&dev_attr_threshold.attr,
++	&dev_attr_gain.attr,
++	&dev_attr_offset.attr,
++	NULL
++};
++
++static unsigned char ft5x0x_read_fw_ver(void)
++{
++	unsigned char ver;
++	ft5x0x_read_reg(FT5X0X_REG_FIRMID, &ver);
++	return(ver);
++}
++
++static void ft5x0x_ts_release(void)
++{
++	struct ft5x0x_ts_data *data = i2c_get_clientdata(this_client);
++
++	input_report_abs(data->input_dev, ABS_MT_TOUCH_MAJOR, 0);
++	input_report_abs(data->input_dev, ABS_PRESSURE, 0);
++        input_report_key(data->input_dev, BTN_TOUCH, 0);
++        input_mt_sync(data->input_dev);
++	input_sync(data->input_dev);
++}
++
++static int ft5x0x_read_data(void)
++{
++	struct ft5x0x_ts_data *data = i2c_get_clientdata(this_client);
++	struct edt_ft5x06_platform_data *pdata = &am335x_touchscreen_edt_data;
++
++	struct ts_event *event = &data->event;
++	u8 buf[62] = {0};
++	long x_tmp, y_tmp;
++	int ret = -1;
++	int i;
++
++	ret = ft5x0x_i2c_rxdata(buf, 61);
++	if (ret < 0) {
++		dev_err(&this_client->dev, "%s read_data i2c_rxdata failed: %d\n", __func__, ret);
++		return ret;
++	}
++
++	memset(event, 0, sizeof(struct ts_event));
++	event->touch_point = buf[2] & 0x0f;
++
++	if (event->touch_point == 0) {
++		ft5x0x_ts_release();
++		return 0;
++	}
++
++	for (i = 0; i < event->touch_point; i++) {
++		x_tmp = ((long)(buf[3+i*6] & 0x0F)<<8 | buf[4+i*6]) * pdata->disp_x;
++		do_div(x_tmp, TOUCH_X);
++		event->x[i] = x_tmp;
++
++		y_tmp = ((long)(buf[5+i*6] & 0x0F)<<8 | buf[6+i*6]) * pdata->disp_y;
++		do_div(y_tmp, TOUCH_Y);
++		event->y[i] = y_tmp;
++	}
++
++	event->pressure = 200;
++
++	return 0;
++}
++
++static void ft5x0x_report_value(void)
++{
++	struct ft5x0x_ts_data *data = i2c_get_clientdata(this_client);
++	struct ts_event *event = &data->event;
++	int i;
++
++	dev_dbg(&this_client->dev, "==ft5x0x_report_value =\n");
++
++	/* Report multi-touch */
++	for (i = 0; i < event->touch_point; i++) {
++		input_report_abs(data->input_dev, ABS_MT_PRESSURE, event->pressure);
++		input_report_abs(data->input_dev, ABS_MT_POSITION_X, event->x[i]);
++		input_report_abs(data->input_dev, ABS_MT_POSITION_Y, event->y[i]);
++		input_mt_sync(data->input_dev);
++		dev_dbg(&this_client->dev, "multi === x%d = %d, y%d = %d, pressure = %d ====\n", i, event->x[i], i, event->y[i], event->pressure);
++	}
++
++	/* Report single-touch */
++	if (event->touch_point) {
++		input_report_abs(data->input_dev, ABS_X, event->x[0]);
++		input_report_abs(data->input_dev, ABS_Y, event->y[0]);
++		input_report_abs(data->input_dev, ABS_PRESSURE, event->pressure);
++		dev_dbg(&this_client->dev, "single === x%d = %d, y%d = %d ====\n", 0, event->x[0], 0, event->y[0]);
++	}
++
++	input_sync(data->input_dev);
++
++}
++
++static void ft5x0x_ts_pen_irq_work(struct work_struct *work)
++{
++	int ret = -1;
++	dev_dbg(&this_client->dev, "==work 1=\n");
++	ret = ft5x0x_read_data();
++	if (ret == 0)
++		ft5x0x_report_value();
++	else
++		dev_dbg(&this_client->dev, "data package read error\n");
++	dev_dbg(&this_client->dev, "==work 2=\n");
++	enable_irq(this_client->irq);
++}
++
++static irqreturn_t ft5x0x_ts_interrupt(int irq, void *dev_id)
++{
++	struct ft5x0x_ts_data *ft5x0x_ts = dev_id;
++	disable_irq_nosync(this_client->irq);
++	dev_dbg(&this_client->dev, "==int=\n");
++	if (!work_pending(&ft5x0x_ts->pen_event_work)) {
++		queue_work(ft5x0x_ts->ts_workqueue, &ft5x0x_ts->pen_event_work);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int
++ft5x0x_ts_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	struct ft5x0x_ts_data *ft5x0x_ts;
++	struct edt_ft5x06_platform_data *pdata = &am335x_touchscreen_edt_data;
++	struct input_dev *input_dev;
++	int err = 0;
++	unsigned char reg_version;
++
++	dev_dbg(&client->dev, "==ft5x0x_ts_probe=\n");
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
++		err = -ENODEV;
++		goto exit_check_functionality_failed;
++	}
++
++	if (!pdata || pdata->disp_x == 0 || pdata->disp_y == 0) {
++		err = -EINVAL;
++		goto exit_check_functionality_failed;
++	}
++
++	/* Request GPIO for IRQ so no one else can request it */
++	dev_dbg(&client->dev, "==request gpio\n");
++	if (gpio_is_valid(pdata->irq_pin)) {
++		err = gpio_request_one(pdata->irq_pin,
++					 GPIOF_IN, "ft5x06 irq");
++		if (err) {
++			dev_err(&client->dev,
++				"Failed to request GPIO %d, error %d\n",
++				pdata->irq_pin, err);
++			goto exit_check_functionality_failed;
++		}
++	}
++
++	dev_dbg(&client->dev, "==kzalloc=\n");
++	ft5x0x_ts = kzalloc(sizeof(*ft5x0x_ts), GFP_KERNEL);
++	if (!ft5x0x_ts)	{
++		err = -ENOMEM;
++		goto exit_alloc_data_failed;
++	}
++
++	this_client = client;
++	i2c_set_clientdata(client, ft5x0x_ts);
++
++	INIT_WORK(&ft5x0x_ts->pen_event_work, ft5x0x_ts_pen_irq_work);
++
++	ft5x0x_ts->ts_workqueue = create_singlethread_workqueue(dev_name(&client->dev));
++	if (!ft5x0x_ts->ts_workqueue) {
++		err = -ESRCH;
++		goto exit_create_singlethread;
++	}
++
++	dev_dbg(&this_client->dev, "==request_irq=\n");
++	err = request_irq(client->irq, ft5x0x_ts_interrupt, IRQF_TRIGGER_FALLING, "ft5x06_ts", ft5x0x_ts);
++	if (err < 0) {
++		dev_err(&client->dev, "ft5x0x_probe: request irq failed\n");
++		goto exit_irq_request_failed;
++	}
++
++	disable_irq(this_client->irq);
++
++	dev_dbg(&client->dev, "==input_allocate_device=\n");
++	input_dev = input_allocate_device();
++	if (!input_dev) {
++		err = -ENOMEM;
++		dev_err(&client->dev, "failed to allocate input device\n");
++		goto exit_input_dev_alloc_failed;
++	}
++
++	ft5x0x_ts->input_dev = input_dev;
++
++	set_bit(EV_ABS, input_dev->evbit);
++	set_bit(ABS_MT_TOUCH_MAJOR, input_dev->absbit);
++	set_bit(ABS_MT_POSITION_X, input_dev->absbit);
++	set_bit(ABS_MT_POSITION_Y, input_dev->absbit);
++	set_bit(ABS_MT_WIDTH_MAJOR, input_dev->absbit);
++
++	input_set_abs_params(input_dev,
++		ABS_MT_POSITION_X, 0, pdata->disp_x-1, 0, 0);
++	input_set_abs_params(input_dev,
++		ABS_MT_POSITION_Y, 0, pdata->disp_y-1, 0, 0);
++	input_set_abs_params(input_dev,
++		ABS_MT_TOUCH_MAJOR, 0, PRESS_MAX, 0, 0);
++	input_set_abs_params(input_dev,
++		ABS_MT_WIDTH_MAJOR, 0, 200, 0, 0);
++	set_bit(ABS_X, input_dev->absbit);
++	set_bit(ABS_Y, input_dev->absbit);
++	set_bit(ABS_PRESSURE, input_dev->absbit);
++	set_bit(ABS_MT_PRESSURE, input_dev->absbit);
++	set_bit(BTN_TOUCH, input_dev->keybit);
++
++	input_set_abs_params(input_dev, ABS_X, 0, pdata->disp_x, 0, 0);
++	input_set_abs_params(input_dev, ABS_Y, 0, pdata->disp_y, 0, 0);
++	input_set_abs_params(input_dev,
++		ABS_PRESSURE, 0, PRESS_MAX, 0 , 0);
++	set_bit(EV_SYN, input_dev->evbit);
++	set_bit(BTN_TOUCH, input_dev->keybit);
++	set_bit(EV_KEY, input_dev->evbit);
++
++	input_dev->name	= FT5X0X_NAME;
++	err = input_register_device(input_dev);
++	if (err) {
++		dev_err(&client->dev,
++		"ft5x0x_ts_probe: failed to register input device: %s\n",
++		dev_name(&client->dev));
++		goto exit_input_register_device_failed;
++	}
++
++	msleep(50);
++	/* get some register information */
++	reg_version = ft5x0x_read_fw_ver();
++	dev_dbg(&this_client->dev, "[FST] Firmware version = 0x%x\n", reg_version);
++	enable_irq(this_client->irq);
++
++	dev_dbg(&client->dev, "==probe over =\n");
++	return sysfs_create_files(&client->dev.kobj, ft5x0x_attr);
++
++exit_input_register_device_failed:
++	input_free_device(input_dev);
++exit_input_dev_alloc_failed:
++	free_irq(client->irq, ft5x0x_ts);
++exit_irq_request_failed:
++	cancel_work_sync(&ft5x0x_ts->pen_event_work);
++	destroy_workqueue(ft5x0x_ts->ts_workqueue);
++exit_create_singlethread:
++	dev_err(&client->dev, "==singlethread error =\n");
++	i2c_set_clientdata(client, NULL);
++	kfree(ft5x0x_ts);
++exit_alloc_data_failed:
++exit_check_functionality_failed:
++	return err;
++}
++
++static int ft5x0x_ts_remove(struct i2c_client *client)
++{
++	struct ft5x0x_ts_data *ft5x0x_ts = i2c_get_clientdata(client);
++	dev_dbg(&this_client->dev, "==ft5x0x_ts_remove=\n");
++	free_irq(client->irq, ft5x0x_ts);
++	input_unregister_device(ft5x0x_ts->input_dev);
++	kfree(ft5x0x_ts);
++	cancel_work_sync(&ft5x0x_ts->pen_event_work);
++	destroy_workqueue(ft5x0x_ts->ts_workqueue);
++	i2c_set_clientdata(client, NULL);
++	return 0;
++}
++
++static const struct i2c_device_id ft5x0x_ts_id[] = {
++	{ FT5X0X_NAME, 0 },{ }
++};
++
++MODULE_DEVICE_TABLE(i2c, ft5x0x_ts_id);
++
++#ifdef CONFIG_OF
++static const struct of_device_id ft5x0x_of_match[] = {
++	{ .compatible = "edt,edt-ft5606", },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, ft5x0x_of_match);
++#endif
++
++static struct i2c_driver ft5x0x_ts_driver = {
++	.probe		= ft5x0x_ts_probe,
++	.remove		= ft5x0x_ts_remove,
++	.id_table	= ft5x0x_ts_id,
++	.driver	= {
++		.owner = THIS_MODULE,
++		.name	= FT5X0X_NAME,
++		.of_match_table = of_match_ptr(ft5x0x_of_match),
++	},
++};
++
++/* FIXME replace __init and __exit with module_i2c_driver */
++static int __init ft5x0x_ts_init(void)
++{
++	int ret;
++	printk(KERN_DEBUG "==ft5x0x_ts_init==\n");
++	ret = i2c_add_driver(&ft5x0x_ts_driver);
++	printk(KERN_DEBUG "ret=%d\n",ret);
++	return ret;
++}
++
++static void __exit ft5x0x_ts_exit(void)
++{
++	dev_dbg(&this_client->dev, "==ft5x0x_ts_exit==\n");
++	i2c_del_driver(&ft5x0x_ts_driver);
++}
++
++module_init(ft5x0x_ts_init);
++module_exit(ft5x0x_ts_exit);
++
++MODULE_DESCRIPTION("FocalTech ft5x0x TouchScreen driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/input/edt-ft5x06.h b/include/linux/input/edt-ft5x06.h
+index 058473a..e7fb310 100644
+--- a/include/linux/input/edt-ft5x06.h
++++ b/include/linux/input/edt-ft5x06.h
+@@ -10,8 +10,12 @@
+  */
+ 
+ struct edt_ft5x06_platform_data {
+-	int irq_gpio;
+-	int reset_gpio;
++	int irq_pin;
++	int reset_pin;
++
++	/* Resolution of display */
++	int disp_x;
++	int disp_y;
+ 
+ 	/* startup defaults for operational parameters */
+ 	bool use_parameters;
+-- 
+2.1.4
+

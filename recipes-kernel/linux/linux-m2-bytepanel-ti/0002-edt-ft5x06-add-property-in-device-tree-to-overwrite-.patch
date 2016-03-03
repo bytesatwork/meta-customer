@@ -1,0 +1,68 @@
+From 5b0179eff90d9ccb13e0f6b4798b8f97775ccaf7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Urs=20F=C3=A4ssler?= <urs.fassler@bytesatwork.ch>
+Date: Fri, 24 Oct 2014 18:12:04 +0200
+Subject: [PATCH 2/3] edt-ft5x06: add property in device tree to overwrite
+ num-x and num-y as workaround for buggy/undocumented
+ touch controller/register
+
+---
+ arch/arm/boot/dts/bytepanel-etm043080adh6.dts |    7 +++++--
+ drivers/input/touchscreen/edt-ft5x06.c        |   10 ++++++++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/boot/dts/bytepanel-etm043080adh6.dts b/arch/arm/boot/dts/bytepanel-etm043080adh6.dts
+index 2aba74f..6d61c61 100644
+--- a/arch/arm/boot/dts/bytepanel-etm043080adh6.dts
++++ b/arch/arm/boot/dts/bytepanel-etm043080adh6.dts
+@@ -128,15 +128,18 @@
+ };
+ 
+ &i2c1 {
+-	touch: edt-ft5406@38 {
++	touch: edt-ft5306@38 {
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&touch_pins>;
+ 
+-		compatible = "edt,edt-ft5406";
++		compatible = "edt,edt-ft5306";
+ 		reg = <0x38>;
+ 		interrupt-parent = <&gpio1>;
+ 		interrupts = <24 0>;
+ 		wake-gpios = <&gpio1 23 1>;
++
++		force-num_x = <20>;
++		force-num_y = <12>;
+ 	};
+ };
+ 
+diff --git a/drivers/input/touchscreen/edt-ft5x06.c b/drivers/input/touchscreen/edt-ft5x06.c
+index de9ae86..fd3362c 100644
+--- a/drivers/input/touchscreen/edt-ft5x06.c
++++ b/drivers/input/touchscreen/edt-ft5x06.c
+@@ -963,6 +963,7 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client,
+ 	struct input_dev *input;
+ 	int error;
+ 	char fw_version[EDT_NAME_LEN];
++	u32 val;						\
+ 
+ 	dev_dbg(&client->dev, "probing for EDT FT5x06 I2C\n");
+ 
+@@ -1030,6 +1031,15 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client,
+ 		"Model \"%s\", Rev. \"%s\", %dx%d sensors\n",
+ 		tsdata->name, fw_version, tsdata->num_x, tsdata->num_y);
+ 
++	if (of_property_read_u32(client->dev.of_node, "force-num_x", &val) == 0) {
++		tsdata->num_x = val;
++		dev_dbg(&client->dev, "force num_x to %i", tsdata->num_x);
++	}
++	if (of_property_read_u32(client->dev.of_node, "force-num_y", &val) == 0) {
++		tsdata->num_y = val;
++		dev_dbg(&client->dev, "force num_y to %i", tsdata->num_y);
++	}
++
+ 	input->name = tsdata->name;
+ 	input->id.bustype = BUS_I2C;
+ 	input->dev.parent = &client->dev;
+-- 
+1.7.10.4
+

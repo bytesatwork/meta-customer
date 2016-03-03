@@ -1,0 +1,55 @@
+From a1f6a621633e2ecbf16631bfc38d8220bba5e512 Mon Sep 17 00:00:00 2001
+From: Markus Kappeler <markus.kappeler@bytesatwork.ch>
+Date: Tue, 3 Feb 2015 09:45:17 +0100
+Subject: [PATCH] bytePANEL: EDT 10.1" display correct muxing
+
+---
+ arch/arm/boot/dts/bytepanel-et10.dts |   14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm/boot/dts/bytepanel-et10.dts b/arch/arm/boot/dts/bytepanel-et10.dts
+index 7b306ed..7303942 100644
+--- a/arch/arm/boot/dts/bytepanel-et10.dts
++++ b/arch/arm/boot/dts/bytepanel-et10.dts
+@@ -13,7 +13,7 @@
+ 	model = "bytePanel ETML101000DH";
+ 	compatible = "batw,bytepanel-etml101000dh", "batw,bytepanel", "batw,m2", "ti,am33xx";
+ 
+-	etm043080adh6 {
++	etml101000dh {
+ 		compatible = "ti,tilcdc,panel";
+ 		status = "okay";
+ 		pinctrl-names = "default";
+@@ -41,10 +41,10 @@
+ 				hback-porch	= <127>;
+ 				hsync-len	= <31>;
+ 				vfront-porch	= <35>;
+-				vback-porch	= <0>;
+-				vsync-len	= <0>;
+-				hsync-active	= <0>;
+-				vsync-active	= <0>;
++				vback-porch	= <2>;
++				vsync-len	= <1>;
++				hsync-active	= <1>;
++				vsync-active	= <1>;
+ 			};
+ 		};
+ 	};
+@@ -62,12 +62,12 @@
+ 		};
+ 
+ 		lcd_lvds_shutdown {
+-			gpios = <&gpio1 26 1>;
++			gpios = <&gpio1 26 0>;
+ 			default-state = "on";
+ 		};
+ 
+ 		lcd_panel_pwr {
+-			gpios = <&gpio1 20 0>;
++			gpios = <&gpio1 20 1>;
+ 			default-state = "on";
+ 		};
+ 	};
+-- 
+1.7.10.4
+
